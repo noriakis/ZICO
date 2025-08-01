@@ -47,10 +47,10 @@ def generate_zinb(B, n=2000, seed=0,
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--d", default=10)
-    ap.add_argument("--n", default=500)
+    ap.add_argument("--d", default=10, type=int)
+    ap.add_argument("--n", default=500, type=int)
     ap.add_argument("--seed", default=1, type=int)
-    ap.add_argument("--device", default="cpu")
+    ap.add_argument("--device", default="cpu", type=str)
     args = vars(ap.parse_args())
 
     B_true = random_dag(args["d"], seed=args["seed"])
