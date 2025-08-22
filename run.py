@@ -5,12 +5,33 @@ from zico import ZICO
 import argparse
 import matplotlib.pyplot as plt
 import seaborn as sns
+import random
+import networkx as nx
 
-def random_dag(d, edge_prob=0.15, seed=0):
+def random_dag_nx(num_nodes, edge_prob=0.25, seed=1):
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+
+    dag = nx.DiGraph()
+    dag.add_nodes_from(range(num_nodes))
+
+    for i in range(num_nodes):
+        for j in range(i + 1, num_nodes):
+            if random.random() < edge_prob:
+                dag.add_edge(i, j)
+
+    assert nx.is_directed_acyclic_graph(dag)
+    adj_matrix = nx.to_numpy_array(dag, dtype=int)
+    return adj_matrix
+
+def random_dag(d, edge_prob=0.25, seed=1):
     rng = np.random.default_rng(seed)
-    B = np.triu((rng.random((d,d)) < edge_prob).astype(float), k=1)
+    B = np.triu((rng.random((d, d)) < edge_prob).astype(float), k=1)
     P = rng.permutation(d)
-    return B[P][:, P]
+    B = B[P][:, P]
+    assert nx.is_directed_acyclic_graph(nx.from_numpy_array(B, create_using=nx.DiGraph))
+    return B
 
 def nb_rng(mu, theta, rng):
     p = theta / (theta + mu)
@@ -18,14 +39,14 @@ def nb_rng(mu, theta, rng):
     return rng.negative_binomial(r, p)
 
 def generate_zinb(B, n=2000, seed=0,
-    gamma_mean=-1, clip_log_mu=20.0):
+    gamma_mean=-1, clip_log_mu=3):
 
     rng = np.random.default_rng(seed)
     d = B.shape[0]
-    W0 = rng.normal( 0.6, 0.2, size=B.shape) * B
-    W1 = rng.normal( 0.8, 0.2, size=B.shape) * B
+    W0 = rng.normal(0.6, 0.2, size=B.shape) * B
+    W1 = rng.normal(0.8, 0.2, size=B.shape) * B
     gamma = rng.normal(gamma_mean, 0.2, size=d)
-    delta = rng.normal( 1.5, 0.2, size=d)
+    delta = rng.normal(1.5, 0.2, size=d)
     theta = np.full(d, 5.0)
 
     X = np.zeros((n, d), dtype=int)
@@ -47,17 +68,23 @@ def generate_zinb(B, n=2000, seed=0,
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--d", default=10, type=int)
-    ap.add_argument("--n", default=500, type=int)
+    ap.add_argument("--d", default=10, type=int, help="the number of variables")
+    ap.add_argument("--n", default=500, type=int, help="the number of observations")
     ap.add_argument("--seed", default=1, type=int)
+    ap.add_argument("--epochs", default=3000, type=int)
     ap.add_argument("--device", default="cpu", type=str)
+    ap.add_argument("--ignore_w0", action="store_true")
+
     args = vars(ap.parse_args())
 
     B_true = random_dag(args["d"], seed=args["seed"])
     X, _ = generate_zinb(B_true, args["n"], seed=args["seed"])
     
     model = ZICO(X.shape[1], device=args["device"]).to(args["device"])
-    model.fit_logdet_batch(X)
+    if args["ignore_w0"]:
+        model.fit_logdet_batch_nb(X, max_iter=args["epochs"])
+    else:
+        model.fit_logdet_batch(X, max_iter=args["epochs"])
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     sns.heatmap(B_true, ax=axes[0], cmap='viridis', square=True)

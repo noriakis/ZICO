@@ -16,7 +16,7 @@ class ZICO(nn.Module):
             self.W0.fill_diagonal_(0); self.W1.fill_diagonal_(0)
         self.gamma = nn.Parameter(torch.zeros(d, device=device))
         self.delta = nn.Parameter(torch.zeros(d, device=device))
-        self.theta = nn.Parameter(torch.ones (d, device=device))  # learnable
+        self.theta = nn.Parameter(torch.ones (d, device=device))
 
     def _acyclicity_logdet_from_W(self, W, s=1.0, eps=1e-8):
         d = self.d
@@ -48,15 +48,17 @@ class ZICO(nn.Module):
     
         eta0 = eta0.clamp(-clamp_eta0, clamp_eta0)
         eta1 = eta1.clamp(clamp_eta1_min, clamp_eta1_max)
-    
-        log_pi = -F.softplus(-eta0)
-        log_1mpi = -F.softplus( eta0)
-    
-        mu = torch.exp(eta1)
-        r = F.softplus(self.theta).clamp(r_min, r_max).view(1, -1) # not theta[j]
+        
         ###
         # Calculate in log scale
         ###
+
+        log_pi = -F.softplus(-eta0)
+        log_1mpi = -F.softplus(eta0)
+    
+        mu = torch.exp(eta1)
+        r = F.softplus(self.theta).clamp(r_min, r_max).view(1, -1) # not theta[j]
+
         log_r = torch.log(r)
         log_rpM = torch.log(r + mu + eps)
         log_p = log_r - log_rpM
@@ -76,30 +78,33 @@ class ZICO(nn.Module):
         """
         return ll.sum(dim=1).mean()
     
-    def fit_logdet_batch(self, X, max_iter=3000, lr=3e-3, beta0=1e-3,
-        beta_growth=1.5, beta_growth_per=100,
-        s=1, batch_size=1024, verbose=True,
-        warm=500, lam=1e-3):
+    def fit_logdet_batch(self, X, max_iter=3000, lr=3e-3,
+        s=1, batch_size=1024, verbose=True, shuffle=True,
+        warm=500, lam=1e-3, mu0=1, mu_decay=0.8, mu_decay_per_epoch=500):
         """
         Used for GPU training
         """
         X = X.to(self.W0.device)
         opt = optim.AdamW(self.parameters(), lr=lr, betas=(0.9, 0.99))
 
-        beta = beta0
+        mu = mu0
         bar = trange(max_iter, disable=not verbose)
         for t in bar:
             lam_t = lam * 0.5 * (1 - math.cos(min(1., t / warm) * math.pi))
-            for idx in batch_indices(X.size(0), batch_size, shuffle=False, device=X.device):
+            for idx in batch_indices(X.size(0), batch_size, shuffle=shuffle, device=X.device):
                 opt.zero_grad()
+                # nll = self.neg_loglik_minibatch(X, idx)
+
                 nll = -self.zinb_loglik_minibatch(X, idx)
                 grp = self.group_lasso()
+                
                 h = self._acyclicity_logdet_from_W(self.W0, s=s) + self._acyclicity_logdet_from_W(self.W1, s=s)
 
                 lambda_align = 1
                 align = lambda_align * ((self.W0 - self.W1).pow(2).sum())
                 # loss = nll + lam_t * self.penalty_W0() + lam_t * self.penalty_W1() + beta * h + align
-                loss = nll + lam_t * grp + beta * h + align
+                # loss = nll + lam_t * grp + beta * h + align
+                loss = mu *(nll + lam_t * grp) + h + align
 
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.parameters(), 1.0)
@@ -108,14 +113,14 @@ class ZICO(nn.Module):
                 with torch.no_grad():
                     self.W0.fill_diagonal_(0); self.W1.fill_diagonal_(0)
 
-            if (t + 1) % beta_growth_per == 0:
-                beta *= beta_growth
+            if (t + 1) % mu_decay_per_epoch == 0:
+                mu *= mu_decay
 
             if verbose:
                 bar.set_postfix(nll=float(nll.item()),
                                 grp=float(grp.item()),
                                 h=float(h.item()),
-                                beta=float(beta))
+                               mu=float(mu))
 
         return self
     
@@ -144,44 +149,40 @@ class ZICO(nn.Module):
         return -self.nb_loglik_minibatch(X, idx, **kw)
     
     def fit_logdet_batch_nb(self, X, max_iter=1000, lr=1e-3,
-        batch_size=1024, s=1.0, lam=1e-3,
-        beta0=1e-3, beta_growth=1.5, beta_growth_per_epoch=100,
+        batch_size=1024, s=1.0, lam=1e-3, shuffle=True,
+        warm=500, mu0=1, mu_decay=0.8, mu_decay_per_epoch=500,
         verbose=True):
         
         X = X.to(self.W0.device)
         n, d = X.shape
         opt = torch.optim.AdamW(self.parameters(), lr=lr, betas=(0.9,0.99))
-        beta = beta0
+        mu = mu0
         bar = trange(max_iter, disable=not verbose)
         for ep in bar:
-            batches = [torch.arange(i, min(i+batch_size, n), device=X.device)
-                       for i in range(0, n, batch_size)]
-            running = 0.0
-            for idx in batches:
+            lam_t = lam * 0.5 * (1 - math.cos(min(1., ep / warm) * math.pi))
+            for idx in batch_indices(X.size(0), batch_size, shuffle=shuffle, device=X.device):
                 opt.zero_grad()
                 nll = self.neg_loglik_minibatch_nb(X, idx)
                 h = self._acyclicity_logdet_from_W(self.W1.abs(), s=s)
                 l1 = self.W1.abs().sum()
 
-                loss = nll + (beta * h + lam * l1)
+                loss = mu *(nll + lam_t * l1) + h
 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
                 opt.step()
 
                 with torch.no_grad():
-                    self.W0.fill_diagonal_(0.0)
                     self.W1.fill_diagonal_(0.0)
 
-                running += float(loss.item())
 
-            if (ep + 1) % beta_growth_per_epoch == 0:
-                beta *= beta_growth
+            if (ep + 1) % mu_decay_per_epoch == 0:
+                mu *= mu_decay
 
             if verbose:
                 bar.set_postfix(nll=float(nll.item()),
                                 h=float(h.item()),
-                                beta=float(beta))
+                                mu=float(mu))
         return self    
 
 def batch_indices(n, batch_size, shuffle=True, device=None):
