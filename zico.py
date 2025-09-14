@@ -32,7 +32,33 @@ class ZICO(nn.Module):
     def group_lasso(self, eps=1e-8):
         g = torch.sqrt(self.W0**2 + self.W1**2 + eps)
         return (g - torch.diag(torch.diag(g))).sum()
+
+    def zip_loglik_minibatch(self, X, idx, clamp_eta0=15.0,
+        clamp_eta1_min=-10.0, clamp_eta1_max=8.0, eps=1e-12):
+
+        Xb = X.index_select(0, idx)
     
+        eta0 = self.gamma.view(1, -1) + Xb @ self.W0
+        eta1 = self.delta.view(1, -1) + Xb @ self.W1
+    
+        eta0 = eta0.clamp(-clamp_eta0, clamp_eta0)
+        eta1 = eta1.clamp(clamp_eta1_min, clamp_eta1_max)
+
+        log_pi   = -F.softplus(-eta0)
+        log_1mpi = -F.softplus(eta0)
+
+        mu = torch.exp(eta1)    
+        k = Xb.to(dtype=eta1.dtype)
+    
+        is_zero = (k == 0)
+        ll0 = torch.logsumexp(torch.stack([log_1mpi, log_pi - mu], dim=-1), dim=-1)
+
+        logpmf_pos = k * eta1 - mu - torch.lgamma(k + 1.0)
+        ll1 = log_pi + logpmf_pos
+        ll = torch.where(is_zero, ll0, ll1)
+        return ll.sum(dim=1).mean()
+    
+
     def zinb_loglik_minibatch(self, X, idx,
         clamp_eta0=15.0, clamp_eta1_min=-10.0,
         clamp_eta1_max=8.0, r_min=1e-4, r_max=1e3,
@@ -78,9 +104,18 @@ class ZICO(nn.Module):
         """
         return ll.sum(dim=1).mean()
     
+    def support_diff_penalty(self, tau=1):
+        ind0 = torch.sigmoid(tau * torch.abs(self.W0))
+        ind1 = torch.sigmoid(tau * torch.abs(self.W1))
+        diff = torch.abs(ind0 - ind1)
+        d = self.W0.shape[0]
+        mask = ~torch.eye(d, dtype=bool, device=self.W0.device)
+        return diff[mask].sum()
+        
     def fit_logdet_batch(self, X, max_iter=3000, lr=3e-3,
-        s=1, batch_size=1024, verbose=True, shuffle=True,
-        warm=500, lam=1e-3, mu0=1, mu_decay=0.8, mu_decay_per_epoch=500):
+        s=1, batch_size=1024, verbose=True, shuffle=True, loss="NB",
+        warm=500, lam=1e-3, mu0=1, mu_decay=0.1, mu_decay_per_epoch=1000,
+        lambda_align=1, norm_type="frobenius"):
         """
         Used for GPU training
         """
@@ -94,17 +129,31 @@ class ZICO(nn.Module):
             for idx in batch_indices(X.size(0), batch_size, shuffle=shuffle, device=X.device):
                 opt.zero_grad()
                 # nll = self.neg_loglik_minibatch(X, idx)
-
-                nll = -self.zinb_loglik_minibatch(X, idx)
+                if loss == "NB":
+                    nll = -self.zinb_loglik_minibatch(X, idx)
+                else:
+                    nll = -self.zip_loglik_minibatch(X, idx)
+                
                 grp = self.group_lasso()
                 
                 h = self._acyclicity_logdet_from_W(self.W0, s=s) + self._acyclicity_logdet_from_W(self.W1, s=s)
+                # h = self._acyclicity_logdet_from_W(torch.sqrt(self.W0**2+self.W1**2+1e-8), s=s)
+                # h = self._acyclicity_logdet_from_W(self.W0.abs() + self.W1.abs(), s=s)
+                
+                if norm_type == "frobenius":
+                    norm = (self.W0 - self.W1).pow(2).sum() # Frobenius
+                elif norm_type == "l1":
+                    norm = torch.sum(torch.abs(self.W0 - self.W1)) # L1
+                elif norm_type == "support":
+                    norm = self.support_diff_penalty()
+                else:
+                    raise ValueError("Unsupported norm")
 
-                lambda_align = 1
-                align = lambda_align * ((self.W0 - self.W1).pow(2).sum())
+                align = lambda_align * norm
+                
                 # loss = nll + lam_t * self.penalty_W0() + lam_t * self.penalty_W1() + beta * h + align
                 # loss = nll + lam_t * grp + beta * h + align
-                loss = mu *(nll + lam_t * grp) + h + align
+                loss = mu * (nll + lam_t * grp) + h + align
 
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.parameters(), 1.0)
@@ -148,10 +197,39 @@ class ZICO(nn.Module):
     def neg_loglik_minibatch_nb(self, X, idx, **kw):
         return -self.nb_loglik_minibatch(X, idx, **kw)
     
+
+    def poisson_loglik_minibatch_stable(self, X, idx, clamp_eta1_min=-10.0,
+                                        clamp_eta1_max=8.0, offset_log=None,
+                                        eps=1e-12):
+        Xb = X.index_select(0, idx)
+        eta1 = self.delta.view(1, -1) + Xb @ self.W1
+    
+        if offset_log is not None:
+            ol = offset_log
+            if ol.dim() == 1:
+                if ol.shape[0] == X.shape[0]:
+                    ol = ol.index_select(0, idx)
+                ol = ol.view(-1, 1)
+            elif ol.dim() == 2 and ol.shape[0] == X.shape[0]:
+                ol = ol.index_select(0, idx)
+            eta1 = eta1 + ol
+    
+        # numerical stability on the log-mean
+        eta1 = eta1.clamp(clamp_eta1_min, clamp_eta1_max)
+    
+        k = Xb.to(dtype=eta1.dtype)
+        mu = torch.exp(eta1)
+        logpmf = k * eta1 - mu - torch.lgamma(k + 1.0)
+    
+        return logpmf.sum(dim=1).mean()
+    
+    def neg_loglik_minibatch_poisson(self, X, idx, **kw):
+        return -self.poisson_loglik_minibatch_stable(X, idx, **kw)
+
     def fit_logdet_batch_nb(self, X, max_iter=1000, lr=1e-3,
         batch_size=1024, s=1.0, lam=1e-3, shuffle=True,
-        warm=500, mu0=1, mu_decay=0.8, mu_decay_per_epoch=500,
-        verbose=True):
+        warm=500, mu0=1, mu_decay=0.1, mu_decay_per_epoch=1000,
+        verbose=True, loss="NB", ignore_logdet=False):
         
         X = X.to(self.W0.device)
         n, d = X.shape
@@ -162,11 +240,18 @@ class ZICO(nn.Module):
             lam_t = lam * 0.5 * (1 - math.cos(min(1., ep / warm) * math.pi))
             for idx in batch_indices(X.size(0), batch_size, shuffle=shuffle, device=X.device):
                 opt.zero_grad()
-                nll = self.neg_loglik_minibatch_nb(X, idx)
+                if loss == "NB":
+                    nll = self.neg_loglik_minibatch_nb(X, idx)
+                else:
+                    nll = self.neg_loglik_minibatch_poisson(X, idx)
+                    
                 h = self._acyclicity_logdet_from_W(self.W1.abs(), s=s)
                 l1 = self.W1.abs().sum()
-
-                loss = mu *(nll + lam_t * l1) + h
+                
+                if ignore_logdet:
+                    loss = nll + lam_t * l1
+                else:
+                    loss = mu *(nll + lam_t * l1) + h
 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
@@ -193,12 +278,3 @@ def batch_indices(n, batch_size, shuffle=True, device=None):
     for i in range(0, n, batch_size):
         yield idx[i:i+batch_size]
     
-def accuracy(true_B, est_B, thresh=0.3, eps=1e-8):
-    est_bin = (est_B.abs() > thresh).float()
-    true_bin = (true_B != 0).float()
-    tp = (est_bin * true_bin).sum()
-    fp = (est_bin * (1 - true_bin)).sum()
-    fn = ((1 - est_bin) * true_bin).sum()
-    fdr = fp / (fp + tp + eps)
-    tpr = tp / (tp + fn + eps)
-    return {'TPR': tpr.item(), 'FDR': fdr.item()}
