@@ -1,7 +1,7 @@
 import math
 import numpy as np
 import torch
-from zico import ZICO
+from .zico import ZICO
 import argparse
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -59,15 +59,25 @@ def topo_order_igraph(B):
     return np.array(order, dtype=int)
 
 def generate_zinb(B, n=2000, seed=0,
-    gamma_mean=0, clip_log_mu=3, W0_sign=1, W1_sign=1):
+    gamma_mean=0, clip_log_mu=3, runif=True,
+    W0_low=0.5, W0_high=2, W1_low=-2, W1_high=-0.5,
+    theta=5):
 
     rng = np.random.default_rng(seed)
     d = B.shape[0]
-    W0 = W0_sign * rng.normal(0.6, 0.2, size=B.shape) * B
-    W1 =  W1_sign * rng.normal(0.8, 0.2, size=B.shape) * B
+    
+    if runif:
+        ## Uniform distribution (by the spcified parameters)
+        W0 = rng.uniform(W0_low, W0_high, size=B.shape) * B
+        W1 = rng.uniform(W1_low, W1_high, size=B.shape) * B
+    else:
+        ## Normal distribution
+        W0 = rng.normal(0.6, 0.2, size=B.shape) * B
+        W1 =  rng.normal(0.8, 0.2, size=B.shape) * B
+
     gamma = rng.normal(gamma_mean, 0.2, size=d) # logit(pi)
     delta = rng.normal(1.5, 0.2, size=d) # log(mu)
-    theta = np.full(d, 5.0)
+    theta = np.full(d, theta)
 
     X = np.zeros((n, d), dtype=int)
 
@@ -76,10 +86,10 @@ def generate_zinb(B, n=2000, seed=0,
         pa = np.where(B[:, j] != 0)[0]
         if pa.size:
             logit_pi = gamma[j] + X[:, pa] @ W0[pa, j]
-            log_mu   = delta[j] + X[:, pa] @ W1[pa, j]
+            log_mu = delta[j] + X[:, pa] @ W1[pa, j]
         else:
             logit_pi = np.full(n, gamma[j])
-            log_mu   = np.full(n, delta[j])
+            log_mu = np.full(n, delta[j])
 
         pi = 1.0 / (1.0 + np.exp(-logit_pi))
         mu = np.exp(np.minimum(log_mu, clip_log_mu))
