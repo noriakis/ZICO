@@ -33,6 +33,7 @@ class ZICO(nn.Module):
         g = torch.sqrt(self.W0**2 + self.W1**2 + eps)
         return (g - torch.diag(torch.diag(g))).sum()
 
+
     def zip_loglik_minibatch(self, X, idx, clamp_eta0=15.0,
         clamp_eta1_min=-10.0, clamp_eta1_max=8.0, eps=1e-12):
 
@@ -44,19 +45,16 @@ class ZICO(nn.Module):
         eta0 = eta0.clamp(-clamp_eta0, clamp_eta0)
         eta1 = eta1.clamp(clamp_eta1_min, clamp_eta1_max)
 
-        log_pi   = -F.softplus(-eta0)
-        log_1mpi = -F.softplus(eta0)
-
-        mu = torch.exp(eta1)    
+        log_pi0 = -F.softplus(-eta0)   # log pi
+        log_1mpi0 = -F.softplus(eta0)   # log(1-pi)
+        mu = torch.exp(eta1)
         k = Xb.to(dtype=eta1.dtype)
-    
-        is_zero = (k == 0)
-        ll0 = torch.logsumexp(torch.stack([log_1mpi, log_pi - mu], dim=-1), dim=-1)
+
+        ll0 = torch.logsumexp(torch.stack([log_pi0, log_1mpi0 - mu], dim=-1), dim=-1)
 
         logpmf_pos = k * eta1 - mu - torch.lgamma(k + 1.0)
-        ll1 = log_pi + logpmf_pos
-        ll = torch.where(is_zero, ll0, ll1)
-
+        ll1 = log_1mpi0 + logpmf_pos
+        ll = torch.where(k == 0, ll0, ll1)
         return ll.sum(dim=1).mean()
     
 
@@ -80,9 +78,9 @@ class ZICO(nn.Module):
         # Calculate in log scale
         ###
 
-        log_pi = -F.softplus(-eta0)
-        log_1mpi = -F.softplus(eta0)
-    
+        log_pi0  = -F.softplus(-eta0)   # log pi
+        log_1mpi0 = -F.softplus(eta0)   # log(1-pi)
+
         mu = torch.exp(eta1)
         r = F.softplus(self.theta).clamp(r_min, r_max).view(1, -1) # not theta[j]
 
@@ -90,21 +88,25 @@ class ZICO(nn.Module):
         log_rpM = torch.log(r + mu + eps)
         log_p = log_r - log_rpM
         log_1mp = torch.log(mu + eps) - log_rpM
-    
         k = Xb
 
-        a = log_1mpi
-        b = log_pi + r * log_p
+        a = log_pi0
+        b = log_1mpi0 + r * log_p
         ll0 = torch.logsumexp(torch.stack([a, b], dim=-1), dim=-1)
-    
-        logpmf = (torch.lgamma(k + r) - torch.lgamma(r) - torch.lgamma(k + 1) + r * log_p + k * log_1mp)
-        ll1 = log_pi + logpmf
+
+        logpmf = (torch.lgamma(k + r) - torch.lgamma(r) - torch.lgamma(k + 1)
+                  + r * log_p + k * log_1mp)
+
+        ll1 = log_1mpi0 + logpmf
+
         ll = torch.where(k == 0, ll0, ll1)
         """
         Put -1 before use
         """
+
         return ll.sum(dim=1).mean()
-    
+
+
     def support_diff_penalty(self, tau=1):
         ind0 = torch.sigmoid(tau * torch.abs(self.W0))
         ind1 = torch.sigmoid(tau * torch.abs(self.W1))
@@ -118,7 +120,7 @@ class ZICO(nn.Module):
         s=1, batch_size=1024, verbose=True, shuffle=True, loss_type="NB",
         warm=500, lam=1e-3, mu0=1, mu_decay=0.1, mu_decay_per_epoch=1000,
         lambda_align=0.1, norm_type="frobenius", logdet_both=False,
-        ignore_logdet=False):
+        ignore_logdet=False, logdet_only_W1=False):
         """
         Used for GPU training.
         """
@@ -142,15 +144,20 @@ class ZICO(nn.Module):
                 if logdet_both:
                     h = self._acyclicity_logdet_from_W(torch.sqrt(self.W0**2+self.W1**2+1e-8), s=s)
                 else:
-                    h = self._acyclicity_logdet_from_W(self.W0, s=s) + self._acyclicity_logdet_from_W(self.W1, s=s)
+                    if logdet_only_W1:
+                        h = self._acyclicity_logdet_from_W(self.W1, s=s)
+                    else:
+                        h = self._acyclicity_logdet_from_W(self.W0, s=s) + self._acyclicity_logdet_from_W(self.W1, s=s)
+
                 # h = self._acyclicity_logdet_from_W(self.W0.abs() + self.W1.abs(), s=s)
-                
+
+
                 if norm_type == "frobenius":
-                    norm = (self.W0 - self.W1).pow(2).sum() # Frobenius
+                    norm = (self.W0 + self.W1).pow(2).sum() # Frobenius
                 elif norm_type == "l1":
-                    norm = torch.sum(torch.abs(self.W0 - self.W1)) # L1
+                    norm = torch.sum(torch.abs(self.W0 + self.W1)) # L1
                 elif norm_type == "mag":
-                    norm = torch.norm(self.W0.abs() - self.W1.abs(), p=1)
+                    norm = torch.norm(self.W0.abs() - self.W1.abs(), p='fro')**2
                 elif norm_type == "support":
                     norm = self.support_diff_penalty()
                 else:
@@ -163,7 +170,8 @@ class ZICO(nn.Module):
                 if ignore_logdet:
                     loss = nll + lam_t * grp + align
                 else:
-                    loss = mu * (nll + lam_t * grp) + h + align
+#                    loss = mu * (nll + lam_t * grp + align) + h
+                    loss = mu * (nll + lam_t * grp) + h + align # Original
 
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.parameters(), 1.0)

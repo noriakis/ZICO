@@ -1,7 +1,7 @@
 import math
 import numpy as np
 import torch
-from .zico import ZICO
+from zico import ZICO
 import argparse
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -41,7 +41,7 @@ def random_dag(d, edge_prob=0.25, m=3, seed=1, type="er"):
     else:
         raise ValueError("please specify graph type by er or ba")
     g.to_directed(mode="acyclic")
-    return np.array(g.get_adjacency()), g
+    return np.array(g.get_adjacency().data), g
 
 def nb_rng(mu, theta, rng):
     p = theta / (theta + mu)
@@ -167,8 +167,6 @@ if __name__ == "__main__":
     ap.add_argument("--threshold", default=0.3, type=float)
     ap.add_argument("--lam", default=1e-3, type=float)
     ap.add_argument("--epochs", default=3000, type=int)
-    ap.add_argument("--W0_sign", default=1, type=int)
-    ap.add_argument("--W1_sign", default=1, type=int)
     ap.add_argument("--device", default="cpu", type=str)
     ap.add_argument("--loss", default="zinb", type=str)
     ap.add_argument("--graph_type", default="er", type=str)
@@ -182,8 +180,7 @@ if __name__ == "__main__":
 
     if args["file"] is None:
         B_true, ig_true = random_dag(args["d"], seed=args["seed"], type=args["graph_type"])
-        X, _ = generate_zinb(B_true, args["n"], seed=args["seed"], W0_sign=args["W0_sign"],
-            W1_sign=args["W1_sign"])
+        X, _ = generate_zinb(B_true, args["n"], seed=args["seed"])
     else:
         import pandas as pd
         X = torch.from_numpy(np.asarray(pd.read_csv(args["file"], sep="\t"))).float()
@@ -207,12 +204,12 @@ if __name__ == "__main__":
     if loss == "nb":
         model.fit_logdet_batch_nb(X, max_iter=args["epochs"], lam=lam)
     elif loss == "poisson":
-        model.fit_logdet_batch_nb(X, max_iter=args["epochs"], loss="Poisson", lam=lam)
+        model.fit_logdet_batch_nb(X, max_iter=args["epochs"], loss_type="Poisson", lam=lam)
     elif loss == "zinb":
-        model.fit_logdet_batch(X, max_iter=args["epochs"], loss="NB", lam=lam,
+        model.fit_logdet_batch(X, max_iter=args["epochs"], loss_type="NB", lam=lam,
             lambda_align=lambda_align)
     elif loss == "zip":
-        model.fit_logdet_batch(X, max_iter=args["epochs"], loss="Poisson", lam=lam,
+        model.fit_logdet_batch(X, max_iter=args["epochs"], loss_type="Poisson", lam=lam,
             lambda_align=lambda_align)
     else:
         raise ValueError("Unknown loss specified")
