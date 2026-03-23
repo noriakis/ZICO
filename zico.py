@@ -61,7 +61,7 @@ class ZICO(nn.Module):
     def zinb_loglik_minibatch(self, X, idx,
         clamp_eta0=15.0, clamp_eta1_min=-10.0,
         clamp_eta1_max=8.0, r_min=1e-4, r_max=1e3,
-        eps=1e-12):
+        eps=1e-12, log_offset=None):
         """
         Batch version
         """
@@ -69,6 +69,12 @@ class ZICO(nn.Module):
         Xb = X.index_select(0, idx)
         eta0 = self.gamma.view(1, -1) + Xb @ self.W0
         eta1 = self.delta.view(1, -1) + Xb @ self.W1
+
+        if log_offset is not None:
+            ob = log_offset.index_select(0, idx)
+            if ob.dim() == 1:
+                ob = ob.unsqueeze(1)
+            eta1 = eta1 + ob
 
     
         eta0 = eta0.clamp(-clamp_eta0, clamp_eta0)
@@ -120,11 +126,13 @@ class ZICO(nn.Module):
         s=1, batch_size=1024, verbose=True, shuffle=True, loss_type="NB",
         warm=500, lam=1e-3, mu0=1, mu_decay=0.1, mu_decay_per_epoch=1000,
         lambda_align=0.1, norm_type="frobenius", logdet_both=False,
-        ignore_logdet=False, logdet_only_W1=False):
+        ignore_logdet=False, logdet_only_W1=False, log_offset=None):
         """
         Used for GPU training.
         """
         X = X.to(self.W0.device)
+        if log_offset is not None:
+            log_offset = log_offset.to(self.W0.device)
         opt = optim.AdamW(self.parameters(), lr=lr, betas=(0.9, 0.99))
 
         mu = mu0
@@ -135,7 +143,7 @@ class ZICO(nn.Module):
                 opt.zero_grad()
                 # nll = self.neg_loglik_minibatch(X, idx)
                 if loss_type == "NB":
-                    nll = -self.zinb_loglik_minibatch(X, idx)
+                    nll = -self.zinb_loglik_minibatch(X, idx, log_offset=log_offset)
                 else:
                     nll = -self.zip_loglik_minibatch(X, idx)
                 
